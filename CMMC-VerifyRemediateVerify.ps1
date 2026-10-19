@@ -1,12 +1,10 @@
 ﻿[CmdletBinding(SupportsShouldProcess)]
 param(
     [switch]$Force,
-    [switch]$EnableBitLocker,
     [switch]$SkipEnrollmentPrompts,
     [string]$NtpServer = 'time.nist.gov',
     [int]$PollIntervalSeconds = 14400,
     [string]$LogPath = "$env:TEMP\CMMC-Pipeline-$(Get-Date -Format 'yyyyMMdd-HHmmss').log",
-    [string]$RecoveryKeyPath = "$env:SystemDrive\BitLocker-Recovery-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt",
     [string]$ReportDir = "$env:ProgramData\temp",
     [switch]$SkipPdfReport
 )
@@ -1001,7 +999,7 @@ function Get-DefenderASRConfigResults {
     }
 }
 function Get-EndpointProtectionResults {
-    $script:CurrentSource = 'Endpoint Protection (Credential Guard/BitLocker/Firewall/UAC)'
+    $script:CurrentSource = 'Endpoint Protection (Credential Guard/Firewall/UAC)'
     Write-Host ""
     $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction SilentlyContinue
     if (-not $dg) {
@@ -1126,71 +1124,6 @@ function Get-EndpointProtectionResults {
         -Expected '<= 900 seconds (15 min)' -Actual $(if ($null -eq $inactivity) {'NOT SET'} else {"$inactivity sec"}) -Pass $inactivityOk `
         -Note "Machine inactivity/session lock timeout is not set to 15 minutes or less. NIST 3.1.10/3.1.11 explicitly requires session lock after a defined period of inactivity." `
         -Fix "Set-ItemProperty -Path '$inactivityPath' -Name InactivityTimeoutSecs -Value 900 -Type DWord"
-    $blModule = Get-Module -ListAvailable -Name BitLocker
-    if (-not $blModule) {
-        Add-Result -Name 'BitLocker Module' -SettingRef 'N/A' -Expected 'Available' -Actual 'NOT AVAILABLE' -Pass $false `
-            -Note "BitLocker PowerShell module isn't available on this system (may be Windows Home edition, which doesn't support BitLocker/only Device Encryption)." `
-            -Fix "BitLocker requires Windows Pro/Enterprise/Education. Verify edition with: (Get-CimInstance Win32_OperatingSystem).Caption"
-    } else {
-        $osVol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
-        $protectionStatus = if ($osVol) { $osVol.ProtectionStatus } else { $null }
-        $encryptOk = ($protectionStatus -eq 'On')
-        Add-Result -Name 'BitLocker Encrypt Device (OS Drive)' -SettingRef 'BitLockerEncryptDevice' `
-            -Expected 'On' -Actual $(if ($null -eq $protectionStatus) { 'UNKNOWN / NOT ENCRYPTED' } else { $protectionStatus }) -Pass $encryptOk `
-            -Note "The OS drive ($env:SystemDrive) is not BitLocker-protected. NIST 3.8.6/3.1.19 -- protects CUI at rest against offline/physical disk access (lost or stolen device)." `
-            -Fix "Enable-BitLocker -MountPoint $env:SystemDrive -EncryptionMethod XtsAes256 -UsedSpaceOnly -TpmProtector"
-        $keyProtectorTypes = @()
-        if ($osVol -and $osVol.KeyProtector) {
-            $keyProtectorTypes = @($osVol.KeyProtector | ForEach-Object { $_.KeyProtectorType })
-        }
-        $startupAuthOk = ($keyProtectorTypes -contains 'Tpm') -or ($keyProtectorTypes -contains 'TpmPin')
-        Add-Result -Name 'BitLocker Startup Authentication' -SettingRef 'BitLockerSystemDrivesRequireStartupAuthentication' `
-            -Expected 'TPM or TPM+PIN protector present' -Actual $(if ($keyProtectorTypes.Count -gt 0) { $keyProtectorTypes -join ',' } else { 'NONE' }) -Pass $startupAuthOk `
-            -Note "No TPM-based startup key protector found on the OS drive. Without this, BitLocker may be relying on a weaker protector or none, undermining pre-boot protection." `
-            -Fix "Manage-bde -protectors -add $env:SystemDrive -TPMAndPIN   (or -TPM alone, per your org's PIN policy)"
-        $method = if ($osVol) { $osVol.EncryptionMethod } else { $null }
-        $methodOk = ($method -match 'XtsAes256')
-        Add-Result -Name 'BitLocker Encryption Method' -SettingRef 'BitLockerEncryptionMethodByDriveType' `
-            -Expected 'XtsAes256' -Actual $(if ($null -eq $method) { 'NONE' } else { $method }) -Pass $methodOk `
-            -Note "OS drive is not using XTS-AES 256. NIST 3.13.11 requires FIPS-validated, strong encryption -- AES-128 or legacy CBC mode are weaker choices than the XTS-AES 256 baseline." `
-            -Fix "Requires decrypt + re-encrypt: manage-bde -off $env:SystemDrive; then Enable-BitLocker -MountPoint $env:SystemDrive -EncryptionMethod XtsAes256 -TpmProtector"
-        $fixedVols = Get-BitLockerVolume -ErrorAction SilentlyContinue | Where-Object { $_.VolumeType -eq 'Data' -and $_.MountPoint -ne $env:SystemDrive }
-        if ($fixedVols) {
-            $allFixedEncrypted = -not ($fixedVols | Where-Object { $_.ProtectionStatus -ne 'On' })
-            Add-Result -Name 'BitLocker Fixed Drives Require Encryption' -SettingRef 'BitLockerFixedDrivesRequireEncryption' `
-                -Expected 'On (all fixed data drives)' -Actual "$(($fixedVols | ForEach-Object {"$($_.MountPoint)=$($_.ProtectionStatus)"}) -join '; ')" -Pass $allFixedEncrypted `
-                -Note "One or more fixed (non-OS) drives are not BitLocker-encrypted. NIST 3.8.6 applies to all drives storing CUI, not just the OS drive." `
-                -Fix "Enable-BitLocker -MountPoint <drive> -EncryptionMethod XtsAes256 -UsedSpaceOnly for each unencrypted fixed drive"
-        } else {
-            Add-Result -Name 'BitLocker Fixed Drives Require Encryption' -SettingRef 'BitLockerFixedDrivesRequireEncryption' `
-                -Expected 'N/A' -Actual 'No additional fixed data drives present' -Pass $true -Informational `
-                -Note "No non-OS fixed drives found on this system." -Fix ''
-        }
-        $osRecoveryConfigured = ($null -ne (Get-RegValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\FVE' -Name 'OSRecovery'))
-        Add-Result -Name 'BitLocker System Drive Recovery Options' -SettingRef 'BitLockerSystemDrivesRecoveryOptions' `
-            -Expected 'Configured per org policy' -Actual $(if ($osRecoveryConfigured) {'Configured'} else {'NOT CONFIGURED'}) `
-            -Pass $osRecoveryConfigured -Informational `
-            -Note "No universal 'correct' value -- this defines whether recovery keys can be saved to AD/Entra, printed, etc. Confirm against your org's actual recovery/escrow policy rather than a generic baseline." `
-            -Fix "Configure via Intune Endpoint Protection profile per your org's key-escrow requirements (e.g. require AD/Entra backup before allowing encryption)."
-        $fdvRecoveryConfigured = ($null -ne (Get-RegValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\FVE' -Name 'FDVRecovery'))
-        Add-Result -Name 'BitLocker Fixed Drive Recovery Options' -SettingRef 'BitLockerFixedDrivesRecoveryOptions' `
-            -Expected 'Configured per org policy' -Actual $(if ($fdvRecoveryConfigured) {'Configured'} else {'NOT CONFIGURED'}) `
-            -Pass $fdvRecoveryConfigured -Informational `
-            -Note "Same as above -- org-specific recovery/escrow choice, not a single correct value." `
-            -Fix "Configure via Intune per your org's key-escrow requirements."
-        $recoveryMsgConfigured = ($null -ne (Get-RegValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\FVE' -Name 'OSRecoveryMessage')) -or ($null -ne (Get-RegValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\FVE' -Name 'OSRecoveryURL'))
-        Add-Result -Name 'BitLocker Recovery Message' -SettingRef 'BitLockerSystemDrivesRecoveryMessage' `
-            -Expected 'Configured with org contact info' -Actual $(if ($recoveryMsgConfigured) {'Configured'} else {'NOT CONFIGURED (default message)'}) `
-            -Pass $recoveryMsgConfigured -Informational `
-            -Note "Custom pre-boot recovery message/URL not set. Not a hard compliance requirement, but best practice for a locked-out user (physical device recovery) to know who to contact." `
-            -Fix "Configure a custom recovery message/URL via Intune pointing to your IT help desk."
-        $warningSuppressed = Get-RegValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\FVE' -Name 'FVEComplianceOverride'
-        Add-Result -Name 'BitLocker Suppress Other-Encryption Warning' -SettingRef 'BitLockerDisableWarningForOtherDiskEncryption' `
-            -Expected 'Per org policy' -Actual $(if ($null -eq $warningSuppressed) {'NOT SET'} else {$warningSuppressed}) `
-            -Pass $true -Informational `
-            -Note "This suppresses a UI warning when third-party disk encryption is detected alongside BitLocker. Not a security control itself -- confirm against your org's intended value; no universal correct answer." `
-            -Fix "Set per your org's documented Intune profile value."
-    }
 }
 function Get-LoginBannerResults {
     $script:CurrentSource = 'Login Banner & Secure Attention Sequence'
@@ -1344,7 +1277,7 @@ function Get-SecurityHardeningResults {
     }
 }
 function Get-GeneralHardeningResults {
-    $script:CurrentSource = 'General Hardening (AutoPlay/RDS/EventLog/BitLocker-Removable/Edge/Firewall)'
+    $script:CurrentSource = 'General Hardening (AutoPlay/RDS/EventLog/Edge/Firewall)'
     Write-Host ""
     $explorerPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer'
     $nonVolume = Get-RegValue -Path $explorerPath -Name 'NoAutoplayfornonVolume'
@@ -1410,32 +1343,6 @@ function Get-GeneralHardeningResults {
             -Note "$channel event log max size does not match the configured value. NIST 3.3.1 (AU-4 audit storage capacity) -- an undersized log rotates/overwrites before incidents can be investigated, silently destroying evidence." `
             -Fix "New-Item -Path '$logPath' -Force | Out-Null; Set-ItemProperty -Path '$logPath' -Name MaxSize -Value $expectedSize -Type DWord"
     }
-    $fvePath = 'HKLM:\SOFTWARE\Policies\Microsoft\FVE'
-    $rdvConfigure = Get-RegValue -Path $fvePath -Name 'RDVConfigureBDE'
-    Add-Result -Name 'Control use of BitLocker on removable drives' -SettingRef 'BitLocker > Removable Data Drives' `
-        -Expected '1 (Enabled)' -Actual $(if ($null -eq $rdvConfigure) {'NOT SET'} else {$rdvConfigure}) -Status $(if ($rdvConfigure -eq 1) {'PASS'} else {'FAIL'}) `
-        -Note "BitLocker removable-drive policy is not enabled. NIST 3.8.6/3.1.19 -- without this, removable media policy for CUI protection isn't enforced at all." `
-        -Fix "New-Item -Path '$fvePath' -Force | Out-Null; Set-ItemProperty -Path '$fvePath' -Name RDVConfigureBDE -Value 1 -Type DWord"
-    $rdvAllow = Get-RegValue -Path $fvePath -Name 'RDVAllowBDE'
-    Add-Result -Name 'Allow users to apply BitLocker on removable drives' -SettingRef 'BitLocker > Removable Data Drives' `
-        -Expected '1 (True)' -Actual $(if ($null -eq $rdvAllow) {'NOT SET'} else {$rdvAllow}) -Status $(if ($rdvAllow -eq 1) {'PASS'} else {'FAIL'}) `
-        -Note "Users are not permitted to apply BitLocker protection to removable drives themselves." `
-        -Fix "New-Item -Path '$fvePath' -Force | Out-Null; Set-ItemProperty -Path '$fvePath' -Name RDVAllowBDE -Value 1 -Type DWord"
-    $rdvDisable = Get-RegValue -Path $fvePath -Name 'RDVDisableBDE'
-    Add-Result -Name 'Allow users to suspend/decrypt BitLocker on removable drives' -SettingRef 'BitLocker > Removable Data Drives' `
-        -Expected '1 (True)' -Actual $(if ($null -eq $rdvDisable) {'NOT SET'} else {$rdvDisable}) -Status $(if ($rdvDisable -eq 1) {'PASS'} else {'FAIL'}) `
-        -Note "Users are not permitted to suspend/decrypt BitLocker on removable drives." `
-        -Fix "New-Item -Path '$fvePath' -Force | Out-Null; Set-ItemProperty -Path '$fvePath' -Name RDVDisableBDE -Value 1 -Type DWord"
-    $rdvDenyWrite = Get-RegValue -Path $fvePath -Name 'RDVDenyWriteAccess'
-    Add-Result -Name 'Deny write access to unprotected removable drives' -SettingRef 'BitLocker > Removable Data Drives' `
-        -Expected '1 (Enabled)' -Actual $(if ($null -eq $rdvDenyWrite) {'NOT SET'} else {$rdvDenyWrite}) -Status $(if ($rdvDenyWrite -eq 1) {'PASS'} else {'FAIL'}) `
-        -Note "Removable drives without BitLocker protection can still be written to. NIST 3.8.6 -- this is the control that actually enforces encryption-before-write for CUI leaving the device on removable media; without it, the other BitLocker settings above are advisory only." `
-        -Fix "New-Item -Path '$fvePath' -Force | Out-Null; Set-ItemProperty -Path '$fvePath' -Name RDVDenyWriteAccess -Value 1 -Type DWord"
-    $rdvCrossOrg = Get-RegValue -Path $fvePath -Name 'RDVDenyCrossOrg'
-    Add-Result -Name 'Deny write access to devices from another organization' -SettingRef 'BitLocker > Removable Data Drives' `
-        -Expected '1 (True)' -Actual $(if ($null -eq $rdvCrossOrg) {'NOT SET'} else {$rdvCrossOrg}) -Status $(if ($rdvCrossOrg -eq 1) {'PASS'} elseif ($null -eq $rdvCrossOrg) {'REVIEW'} else {'FAIL'}) `
-        -Note "LOWER CONFIDENCE MAPPING: this specific sub-option's registry value name is less consistently documented than the other BitLocker settings above. If this shows NOT SET/REVIEW rather than a clear PASS/FAIL, verify manually via: rsop.msc > Computer Configuration > Administrative Templates > Windows Components > BitLocker Drive Encryption > Removable Data Drives, rather than trusting this check alone." `
-        -Fix "Verify the exact registry value via rsop.msc first, then: Set-ItemProperty -Path '$fvePath' -Name RDVDenyCrossOrg -Value 1 -Type DWord"
     $fipsVal = Get-RegValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy' -Name 'Enabled'
     Add-Result -Name 'Allow Fips Algorithm Policy' -SettingRef 'Cryptography' `
         -Expected '1 (Allow)' -Actual $(if ($null -eq $fipsVal) {'NOT SET'} else {$fipsVal}) -Status $(if ($fipsVal -eq 1) {'PASS'} else {'FAIL'}) `
@@ -1977,7 +1884,7 @@ function Invoke-DefenderASRRemediation {
 function Invoke-HardeningRemediation {
     $script:CurrentSource = 'General Hardening'
     Write-Log ""
-    Write-Log "--- Area 4: AutoRun / Autoplay / BitLocker-write-block / Edge sync (4 items) ---" 'Cyan'
+    Write-Log "--- Area 4: AutoRun / Autoplay / Edge sync (3 items) ---" 'Cyan'
     Update-ProgressNotification -Step 5 -Total 10 -Label 'Area 4: General Hardening'
     $explorerPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer'
     $explorerBackup = "$explorerPath\_PreRemediationBackup"
@@ -1989,12 +1896,6 @@ function Invoke-HardeningRemediation {
         $after = Get-RegValue -Path $explorerPath -Name 'NoDriveTypeAutoRun'
         Add-Summary -Name 'Turn off Autoplay (All drives)' -Pass ($after -eq 255) -Detail "NoDriveTypeAutoRun = $after (expected 255)"
         Write-Log "NoDriveTypeAutoRun -> $after"
-    $fvePath = 'HKLM:\SOFTWARE\Policies\Microsoft\FVE'
-    $fveBackup = "$fvePath\_PreRemediationBackup"
-        Set-RegValueTracked -Path $fvePath -Name 'RDVDenyWriteAccess' -Value 1 -BackupPath $fveBackup
-        $after = Get-RegValue -Path $fvePath -Name 'RDVDenyWriteAccess'
-        Add-Summary -Name 'Deny write access to unprotected removable drives' -Pass ($after -eq 1) -Detail "RDVDenyWriteAccess = $after (expected 1). Applies to drives connected AFTER this change -- already-mounted removable drives are unaffected until reconnected."
-        Write-Log "RDVDenyWriteAccess -> $after"
     $edgePath = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
     $edgeBackup = "$edgePath\_PreRemediationBackup"
         Set-RegValueTracked -Path $edgePath -Name 'SyncDisabled' -Value 1 -BackupPath $edgeBackup
@@ -2005,7 +1906,7 @@ function Invoke-HardeningRemediation {
 function Invoke-EndpointProtectionRemediation {
     $script:CurrentSource = 'Endpoint Protection'
     Write-Log ""
-    Write-Log "--- Area 5: Firewall / VBS / Credential Guard / BitLocker ---" 'Cyan'
+    Write-Log "--- Area 5: Firewall / VBS / Credential Guard ---" 'Cyan'
     Update-ProgressNotification -Step 6 -Total 10 -Label 'Area 5: Endpoint Protection'
         $before = (Get-NetFirewallProfile -Profile Domain).AllowUnicastResponseToMulticast
         if ($before -eq $false) {
@@ -2082,77 +1983,6 @@ function Invoke-EndpointProtectionRemediation {
                 $cgActuallyRunning = ($dg.SecurityServicesRunning -contains 1)
                 Add-Summary -Name 'Credential Guard' -Status $(if ($cgActuallyRunning) {'PASS'} else {'PENDING REBOOT'}) -Detail "Registry already compliant. SecurityServicesRunning=$($dg.SecurityServicesRunning -join ',')$(if(-not $cgActuallyRunning){' (registry correct but not yet running -- reboot needed)'})"
             }
-    }
-    if (-not $EnableBitLocker) {
-        Write-Log "`nNot applying automated BitLocker encryption (-EnableBitLocker not passed)." 'Yellow'
-        Add-Summary -Name 'BitLocker (automated encryption)' -Status 'SKIPPED' -Detail 'Not requested -- run with -EnableBitLocker for silent XTS-AES256+TPM encryption'
-        if ($SkipEnrollmentPrompts) {
-            Write-Log "Not checking BitLocker enrollment status either (-SkipEnrollmentPrompts)." 'Yellow'
-        } else {
-            $osVolCheck = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
-            $bitlockerOn = $osVolCheck -and ($osVolCheck.ProtectionStatus -eq 'On')
-            if ($bitlockerOn) {
-                Write-Log "BitLocker is already On for $env:SystemDrive -- nothing further needed." 'Green'
-                Add-Summary -Name 'BitLocker Enrollment' -Status 'PASS' -Detail 'ProtectionStatus=On'
-            } else {
-                Write-Log "BitLocker is not On for $env:SystemDrive. Instead of encrypting automatically, launching Windows' own BitLocker setup page so the signed-in user can choose how to back up their recovery key themselves." 'Yellow'
-                $launched = Start-InteractiveProcess -Command 'control.exe /name Microsoft.BitLockerDriveEncryption' -Description 'BitLocker setup (Control Panel)'
-                Add-Summary -Name 'BitLocker Enrollment' -Status $(if ($launched) {'PROMPT LAUNCHED'} else {'NEEDS MANUAL FOLLOW-UP'}) -Detail "ProtectionStatus=$($osVolCheck.ProtectionStatus). User must complete encryption + recovery key backup interactively. (Or re-run with -EnableBitLocker for fully automated encryption instead.)"
-            }
-        }
-    } else {
-        $tpm = Get-Tpm -ErrorAction SilentlyContinue
-        if (-not $tpm -or -not $tpm.TpmPresent -or -not $tpm.TpmReady) {
-            Write-Log "`nNo ready TPM detected. Cannot proceed with TPM-protected BitLocker encryption safely -- skipping." 'Red'
-            Add-Summary -Name 'BitLocker (all 3 checks)' -Status 'SKIPPED' -Detail 'No ready TPM present on this device'
-        } else {
-            Write-Log "`nTPM confirmed present and ready. Proceeding with BitLocker." 'Cyan'
-                $osVol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
-                if ($osVol -and $osVol.ProtectionStatus -eq 'On') {
-                    Write-Log "BitLocker is already On for $env:SystemDrive. Skipping Enable-BitLocker; will still verify method/protector below." 'Yellow'
-                } else {
-                    try {
-                        Enable-BitLocker -MountPoint $env:SystemDrive -EncryptionMethod XtsAes256 -UsedSpaceOnly -TpmProtector -SkipHardwareTest -ErrorAction Stop
-                        Write-Log "BitLocker encryption started on $env:SystemDrive (used-space-only, XTS-AES 256, TPM protector)." 'Green'
-                    } catch {
-                        Write-Log "Enable-BitLocker failed: $($_.Exception.Message)" 'Red'
-                        Add-Summary -Name 'BitLocker Encrypt Device (OS Drive)' -Status 'FAIL' -Detail $_.Exception.Message
-                    }
-                }
-                $osVol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
-                $recoveryProtector = $osVol.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | Select-Object -First 1
-                if (-not $recoveryProtector) {
-                    Add-BitLockerKeyProtector -MountPoint $env:SystemDrive -RecoveryPasswordProtector | Out-Null
-                    $osVol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
-                    $recoveryProtector = $osVol.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | Select-Object -First 1
-                }
-                if ($recoveryProtector) {
-                    "BitLocker Recovery Key for $env:SystemDrive`nGenerated: $(Get-Date -Format 'o')`nComputer: $env:COMPUTERNAME`nRecovery Key ID: $($recoveryProtector.KeyProtectorId)`nRecovery Password: $($recoveryProtector.RecoveryPassword)" |
-                        Out-File -FilePath $RecoveryKeyPath -Encoding UTF8
-                    Write-Log "*** RECOVERY KEY SAVED TO: $RecoveryKeyPath ***" 'Red'
-                    Write-Log "*** MOVE THIS FILE OFF THE DEVICE (secure share, password manager, escrow system) BEFORE THIS MACHINE COULD BE LOST OR THE FILE COULD BE DELETED. Anyone with disk access to this unencrypted file could read the recovery key. ***" 'Red'
-                    try {
-                        $csInfo = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
-                        if ($csInfo.PartOfDomain) {
-                            Backup-BitLockerKeyProtector -MountPoint $env:SystemDrive -KeyProtectorId $recoveryProtector.KeyProtectorId -ErrorAction Stop
-                            Write-Log "Recovery key also backed up to Active Directory." 'Green'
-                        } else {
-                            Write-Log "Device is not domain-joined -- skipped AD backup. If this device is Entra ID (Azure AD) joined, verify the key escrowed automatically (check dsregcmd /status), or back it up manually: manage-bde -protectors -adbackup $env:SystemDrive -id $($recoveryProtector.KeyProtectorId)" 'Yellow'
-                        }
-                    } catch {
-                        Write-Log "AD/Entra backup of recovery key failed or wasn't applicable: $($_.Exception.Message). The key is still saved locally at $RecoveryKeyPath -- back it up manually." 'Yellow'
-                    }
-                } else {
-                    Write-Log "Could not confirm a recovery password protector was created. Check manually: Get-BitLockerVolume -MountPoint $env:SystemDrive | Select -ExpandProperty KeyProtector" 'Red'
-                }
-                $osVol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
-                $keyProtectorTypes = @()
-                if ($osVol -and $osVol.KeyProtector) { $keyProtectorTypes = @($osVol.KeyProtector | ForEach-Object { $_.KeyProtectorType }) }
-                Add-Summary -Name 'BitLocker Encrypt Device (OS Drive)' -Status $(if ($osVol.ProtectionStatus -eq 'On' -or $osVol.VolumeStatus -eq 'EncryptionInProgress') {'IN PROGRESS / ON'} else {'CHECK MANUALLY'}) -Detail "ProtectionStatus=$($osVol.ProtectionStatus), VolumeStatus=$($osVol.VolumeStatus), EncryptionPercentage=$($osVol.EncryptionPercentage)%"
-                Add-Summary -Name 'BitLocker Startup Authentication' -Status $(if ($keyProtectorTypes -contains 'Tpm') {'PASS'} else {'CHECK MANUALLY'}) -Detail "Protectors: $($keyProtectorTypes -join ',')"
-                Add-Summary -Name 'BitLocker Encryption Method' -Status $(if ($osVol.EncryptionMethod -match 'XtsAes256') {'PASS'} else {'CHECK MANUALLY (may show correctly only once encryption completes)'}) -Detail "EncryptionMethod=$($osVol.EncryptionMethod)"
-                Write-Log "`nEncryption is running in the background and can take from under an hour to several hours depending on drive size (used-space-only mode). Check progress anytime with: Get-BitLockerVolume -MountPoint $env:SystemDrive | Select EncryptionPercentage" 'Cyan'
-        }
     }
 }
 function Invoke-DeviceControlGuidance {
@@ -2380,11 +2210,8 @@ function Invoke-FullRemediation {
     Write-Log "=== CMMC Level 2 / NIST SP 800-171 Remediation ===" 'Cyan'
     Write-Log "Running unattended -- no confirmation prompts. Each setting is checked against its expected value first; only settings that are actually out of compliance are changed." 'Cyan'
     Write-Log ""
-    if ($EnableBitLocker) {
-        Write-Log "NOTE: -EnableBitLocker is set -- if BitLocker is off, full-disk encryption will be applied automatically without further confirmation." 'Yellow'
-    }
     if (-not $SkipEnrollmentPrompts) {
-        Write-Log "NOTE: if BitLocker appears to be off, this run will open the Windows BitLocker setup screen for the signed-in user to complete (informational only -- does not block or wait). Windows Hello enrollment is checked and reported only -- no setup screen is launched for it (Intune handles that at enrollment time)." 'Yellow'
+        Write-Log "NOTE: Windows Hello enrollment is checked and reported only -- no setup screen is launched for it (Intune handles that at enrollment time)." 'Yellow'
     }
     $script:Summary = @()
     Invoke-NTPRemediation
@@ -2437,13 +2264,7 @@ Write-Host "Baseline report : $($phase1.CsvPath)" -ForegroundColor DarkGray
 Write-Host "                  $($phase1.HtmlPath)" -ForegroundColor DarkGray
 Write-Host "Final report    : $($phase3.CsvPath)" -ForegroundColor DarkGray
 Write-Host "                  $($phase3.HtmlPath)" -ForegroundColor DarkGray
-$osVolFinal = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
-$bitlockerEncryptingNow = $osVolFinal -and ($osVolFinal.VolumeStatus -eq 'EncryptionInProgress')
-if ($bitlockerEncryptingNow) {
-    Update-ProgressNotification -Step 10 -Total 10 -Label 'Complete.' -Done -RebootNote 'BitLocker encrypting -- reboot deferred.'
-    Write-Log "" 'Yellow'
-    Write-Log "NOT restarting automatically: BitLocker encryption is actively in progress on $env:SystemDrive ($($osVolFinal.EncryptionPercentage)% complete). Restarting now could interrupt it. Let encryption finish, then reboot manually for anything else pending above." 'Yellow'
-} elseif ($phase2.RebootCount -gt 0) {
+if ($phase2.RebootCount -gt 0) {
     Update-ProgressNotification -Step 10 -Total 10 -Label 'Complete.' -Done -RebootNote 'Will reboot in 2 minutes.'
     Write-Log "" 'Yellow'
     Write-Log "Restarting automatically in 2 minutes to apply the pending change(s) from remediation." 'Yellow'
