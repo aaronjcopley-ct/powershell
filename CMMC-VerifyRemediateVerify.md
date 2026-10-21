@@ -38,10 +38,10 @@ Each check is tagged with a source area and mapped to a CMMC / NIST 800-171 cont
 |---|---|
 | Audit and crypto | Audit policy subcategories (credential validation, file system, process creation, removable storage, account management, privilege use), FIPS algorithm policy, NTP client and server, command line in process creation events |
 | Defender and ASR configuration | Real-time, behavior and cloud protection, PUA blocking, signature interval, scheduled scan type, day and time, Network Protection, SmartScreen, sideloading and MSI controls, Game DVR, Edge SmartScreen, firewall dropped-packet logging |
-| Endpoint protection | Credential Guard and VBS, firewall profile settings, NTLM session security, machine inactivity limit |
+| Endpoint protection | Credential Guard and VBS, BitLocker state of the OS and fixed drives (read-only), firewall profile settings, NTLM session security, machine inactivity limit |
 | Login banner and SAS | Legal notice title and text, secure attention sequence settings |
 | Security hardening | Account lockout (on builds that support it), UAC, guest account, privacy settings |
-| General hardening | AutoPlay and AutoRun, RDS session limits and encryption, event log sizes, Edge sync, FIPS |
+| General hardening | AutoPlay and AutoRun, RDS session limits and encryption, event log sizes, BitLocker policy for removable drives (read-only), Edge sync, FIPS |
 | Windows LAPS | CSP and GPO LAPS policy values |
 | ASR rules | 19 Attack Surface Reduction rules plus Controlled Folder Access |
 | Device control | Removable storage, Bluetooth and device control policy |
@@ -88,4 +88,4 @@ The run log goes to `-LogPath`. The end of the run prints pass, fail and other c
 
 ## Scope note
 
-BitLocker checks and automated encryption were removed from this script. Encryption at rest (NIST 3.8.6) is not evaluated here and needs to be evidenced another way.
+BitLocker is report-only in this script. The checks for the OS drive, fixed drives and removable drive policy still run and appear in the CSV, HTML and PDF reports, but the script never enables, changes or backs up BitLocker and has no BitLocker parameters. Remediation does not touch BitLocker or the removable drive write-block, so a failing BitLocker row stays failing after Phase 2 until it is fixed by policy, for example Intune, or by one of the BitLocker scripts in this repository. The fix text shown in a failing row is guidance for an admin and is not run by the script.
